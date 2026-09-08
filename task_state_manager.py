@@ -1,9 +1,11 @@
 # task_state_manager.py
 """
-Task State Manager - Manages the complete VR task sequence:
+RECTIFIED v4.0 - Task State Manager
+
+Manages the complete VR task sequence:
 Rest → Reach → Grasp → Lift → Transport → Placement → Release → Return
 
-RECTIFIED v4.0: Full 8-phase task workflow with state transitions, timing,
+Full 8-phase task workflow with automatic state transitions, timing,
 and real-time task logging for CSV data capture.
 """
 
@@ -33,33 +35,34 @@ class TaskStateManager:
     timing thresholds, and real-time task phase logging.
     
     Phases:
-    1. REST           - Hand idle at pickup position
+    1. REST           - Hand idle at pickup position over Table 1 bottle
     2. REACH          - Hand moving toward bottle (within approach distance)
     3. GRASP          - Fingers closing on bottle (high flex, contacts registered)
     4. LIFT           - Bottle being lifted (detected via upward hand motion)
     5. TRANSPORT      - Bottle moving to Table2 (crossing boundary)
     6. PLACEMENT      - Hand positioned at Table2 drop zone
-    7. RELEASE        - Fingers opening, bottle released
+    7. RELEASE        - Fingers opening, bottle released and placed
     8. RETURN         - Hand returning to initial pickup pose
     9. DONE           - Task sequence complete
     """
 
     def __init__(self, table1_center, table2_center, bottle_radius=0.09,
                  bottle_height=0.45, pickup_radius=0.15, place_radius=0.18,
-                 reach_distance=0.50):
+                 reach_distance=0.50, table_thickness=0.08):
         self.table1 = list(table1_center)
         self.table2 = list(table2_center)
         self.bottle_radius = bottle_radius
         self.bottle_height = bottle_height
         self.pickup_radius = pickup_radius
         self.place_radius = place_radius
-        self.reach_distance = reach_distance  # Distance to bottle to enter REACH
+        self.reach_distance = reach_distance
+        self.table_thickness = table_thickness
 
         # State tracking
         self.phase = TaskPhase.REST
         self._phase_start_time = time.time()
         self._last_announced_phase = None
-        self._phase_history = []  # For logging
+        self._phase_history = []
 
         # Grasp state
         self.is_grasping = False
@@ -77,9 +80,12 @@ class TaskStateManager:
         self._transport_started = False
         self._transport_start_time = None
 
-        logging.info("✓ TaskStateManager initialized")
-        logging.info(f"  Table1: {self.table1}")
-        logging.info(f"  Table2: {self.table2}")
+        logging.info(f"\n✓ TaskStateManager initialized")
+        logging.info(f"  Table1 Center: {self.table1}")
+        logging.info(f"  Table2 Center: {self.table2}")
+        logging.info(f"  Pickup Radius: {self.pickup_radius}m")
+        logging.info(f"  Place Radius: {self.place_radius}m")
+        logging.info(f"  Reach Distance: {self.reach_distance}m\n")
 
     @staticmethod
     def _distance(a, b):
@@ -99,8 +105,16 @@ class TaskStateManager:
         """Position of bottle resting on Table1"""
         return [
             self.table1[0],
-            self.table1[1] + 0.08 / 2.0 + self.bottle_height / 2.0,
+            self.table1[1] + self.table_thickness / 2.0 + self.bottle_height / 2.0,
             self.table1[2],
+        ]
+
+    def get_bottle_placed_pos(self):
+        """Position of bottle resting on Table2"""
+        return [
+            self.table2[0],
+            self.table2[1] + self.table_thickness / 2.0 + self.bottle_height / 2.0,
+            self.table2[2],
         ]
 
     def get_phase(self):
@@ -114,15 +128,15 @@ class TaskStateManager:
     def get_phase_info(self):
         """Get human-readable phase info for HUD"""
         phase_messages = {
-            TaskPhase.REST: "READY - Position hand near bottle",
-            TaskPhase.REACH: "REACHING - Move toward bottle",
-            TaskPhase.GRASP: "GRASPING - Squeeze to grip",
-            TaskPhase.LIFT: "LIFTING - Pull hand upward",
-            TaskPhase.TRANSPORT: "CARRYING - Move to Table 2",
-            TaskPhase.PLACEMENT: "PLACING - Position over drop zone",
-            TaskPhase.RELEASE: "RELEASING - Open hand to place",
-            TaskPhase.RETURN: "RETURNING - Hand going back home",
-            TaskPhase.DONE: "COMPLETE - Task finished!",
+            TaskPhase.REST: "[1/8] REST - Hand idle, ready to approach bottle",
+            TaskPhase.REACH: "[2/8] REACH - Move toward bottle on Table 1",
+            TaskPhase.GRASP: "[3/8] GRASP - Squeeze glove to grip bottle",
+            TaskPhase.LIFT: "[4/8] LIFT - Pull hand upward to lift bottle",
+            TaskPhase.TRANSPORT: "[5/8] TRANSPORT - Carry bottle to Table 2",
+            TaskPhase.PLACEMENT: "[6/8] PLACEMENT - Position over drop zone at Table 2",
+            TaskPhase.RELEASE: "[7/8] RELEASE - Open hand to place bottle",
+            TaskPhase.RETURN: "[8/8] RETURN - Hand returning to initial position",
+            TaskPhase.DONE: "COMPLETE - Task cycle finished! Press C to restart.",
         }
         return phase_messages.get(self.phase, "UNKNOWN")
 
@@ -145,8 +159,9 @@ class TaskStateManager:
         bottle_rest = self.get_bottle_rest_pos()
         dist_to_bottle = self._distance(palm_pos, bottle_rest)
         horiz_dist_table2 = self._horizontal_distance(hand_pos, self.table2)
+        horiz_dist_table1 = self._horizontal_distance(hand_pos, self.table1)
         bottle_height = bottle_pos[1]
-        table1_top_y = self.table1[1] + 0.08 / 2.0
+        table1_top_y = self.table1[1] + self.table_thickness / 2.0
 
         # State machine transitions
         if self.phase == TaskPhase.REST:
@@ -156,7 +171,9 @@ class TaskStateManager:
 
         elif self.phase == TaskPhase.REACH:
             # REACH → GRASP: Hand gets close enough and starts grasping
-            if dist_to_bottle < self.pickup_radius and grasp_amt >= self.grasp_threshold and contacts >= self.min_finger_contacts:
+            if (dist_to_bottle < self.pickup_radius and 
+                grasp_amt >= self.grasp_threshold and 
+                contacts >= self.min_finger_contacts):
                 self._transition_to_phase(TaskPhase.GRASP)
                 self.is_grasping = True
                 self.grasp_start_time = time.time()
@@ -181,7 +198,7 @@ class TaskStateManager:
 
         elif self.phase == TaskPhase.LIFT:
             # LIFT → TRANSPORT: Bottle crosses horizontal boundary toward Table2
-            if horiz_dist_table2 < self._horizontal_distance(hand_pos, self.table1) - 0.3:
+            if horiz_dist_table2 < horiz_dist_table1 - 0.3:
                 self._transition_to_phase(TaskPhase.TRANSPORT)
                 self._transport_started = True
                 self._transport_start_time = time.time()
@@ -198,7 +215,7 @@ class TaskStateManager:
             if horiz_dist_table2 < self.place_radius:
                 self._transition_to_phase(TaskPhase.PLACEMENT)
             # TRANSPORT → LIFT: Hand moves back toward Table1
-            elif horiz_dist_table2 > self._horizontal_distance(hand_pos, self.table1):
+            elif horiz_dist_table2 > horiz_dist_table1:
                 self._transition_to_phase(TaskPhase.LIFT)
             # TRANSPORT → REACH: Hand releases mid-transit
             if grasp_amt < self.release_threshold:
@@ -206,10 +223,6 @@ class TaskStateManager:
                 self.is_grasping = False
 
         elif self.phase == TaskPhase.PLACEMENT:
-            # PLACEMENT → RELEASE: Hand stays in place, ready to release
-            if horiz_dist_table2 < self.place_radius and grasp_amt >= self.grasp_threshold:
-                # Wait for release action
-                pass
             # PLACEMENT → RELEASE: Hand opens (release detected)
             if grasp_amt < self.release_threshold:
                 self._transition_to_phase(TaskPhase.RELEASE)
@@ -240,7 +253,8 @@ class TaskStateManager:
 
         elapsed = self.get_phase_elapsed()
         self._phase_history.append({
-            'phase': self.phase,
+            'from': self.phase,
+            'to': new_phase,
             'duration': elapsed,
             'timestamp': time.time(),
         })
@@ -249,9 +263,8 @@ class TaskStateManager:
         self.phase = new_phase
         self._phase_start_time = time.time()
 
-        msg = f"[PHASE] {old_phase} → {new_phase} (elapsed {elapsed:.2f}s)"
+        msg = f"[TASK STATE] {old_phase:12s} → {new_phase:12s} (elapsed {elapsed:6.2f}s)"
         logging.info(msg)
-        self._last_announced_phase = new_phase
 
     def can_grasp(self, palm_pos, bottle_pos):
         """Check if grasp is allowed at current position"""
